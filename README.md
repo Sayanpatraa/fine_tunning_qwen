@@ -1,200 +1,316 @@
+# Writing Prompts LLM Fine-Tuning
 
-# Qwen & WritingPrompts — Fine-Tuning Pipeline
+This repository fine-tunes an open Hugging Face causal language model on the Kaggle Writing Prompts dataset.
 
-> **QLoRA supervised fine-tuning of Qwen2.5 on the Reddit WritingPrompts dataset,
-> with train / validation / test splits and comprehensive automatic evaluation.**
+It supports:
 
----
-
-## Dataset
-
-| Split      | Examples   | Description                                     |
-|------------|------------|-------------------------------------------------|
-| Train      | ~245 k     | 90 % of total; used for gradient updates        |
-| Validation | ~13.7 k    | 5 % ; used for `eval_loss` and early stopping   |
-| Test       | ~13.7 k    | 5 % ; held out; only touched during evaluation  |
-
-The dataset is the **WritingPrompts** corpus (Fan et al., 2018), scraped from Reddit's
-`r/WritingPrompts` subreddit and released by Facebook AI Research.
-Each row is a *(prompt, story)* pair — a short creative-writing seed plus a human-written
-story of several hundred words in response.
-
-**Source options**
-- **HuggingFace Hub** (default, no credentials): `euclaise/writingprompts`
-- **Kaggle** (original): `ratthachat/writing-prompts` — requires `~/.kaggle/kaggle.json`
+- Kaggle dataset download
+- Prompt-story dataset preparation
+- QLoRA fine-tuning
+- Dynamic hyperparameters through YAML and CLI overrides
+- Testing / story generation
+- Streamlit UI for training, testing, and parameter control
 
 ---
 
-## Hardware requirements
-
-| Mode              | Min VRAM  | Recommended                              |
-|-------------------|-----------|------------------------------------------|
-| 7B QLoRA (4-bit)  | 16 GB     | Single A100-40GB or 2× RTX 3090          |
-| 7B full fine-tune | ~80 GB    | 4× A100-80GB + DeepSpeed ZeRO-3          |
-| 1.5B QLoRA (4-bit)| 8 GB      | RTX 3080 / T4 (quick testing)            |
-
-For a fast smoke-test, use `--model Qwen/Qwen2.5-1.5B-Instruct --max_train 2000 --epochs 1`.
-
----
-
-## Quick start
+## 1. Create environment
 
 ```bash
-# 1. Install dependencies
+python3 -m venv venv
+source venv/bin/activate
+pip install -U pip
 pip install -r requirements.txt
-
-# Optional: Flash Attention 2 (significant speedup on Ampere+)
-pip install flash-attn --no-build-isolation
-
-# 2. Prepare the data  (downloads ~4 GB from HuggingFace)
-python data_prep.py
-
-# 3. Fine-tune  (reads config.yaml)
-python train.py
-
-# 4. Evaluate the fine-tuned adapter vs the baseline
-python evaluate.py                   # fine-tuned
-python evaluate.py --baseline        # un-fine-tuned Qwen for comparison
 ```
 
 ---
 
-## File structure
+## 2. Download Kaggle dataset
 
-```
-qwen-writing-prompts/
-├── config.yaml          ← all hyperparameters (model, LoRA, training, eval)
-├── requirements.txt     ← Python dependencies
-├── data_prep.py         ← download + clean + split the dataset
-├── train.py             ← QLoRA training with TRL SFTTrainer
-├── evaluate.py          ← perplexity, ROUGE, BERTScore, diversity metrics
-│
-├── data/
-│   └── processed/       ← HuggingFace DatasetDict (train / validation / test)
-│
-└── outputs/
-    ├── qwen-writing-prompts/
-    │   ├── checkpoint-*/        ← intermediate checkpoints
-    │   ├── best_adapter/        ← best LoRA adapter weights
-    │   └── merged_model/        ← merged full model (optional)
-    └── results/
-        ├── metrics_*.json       ← evaluation metrics
-        └── samples_*.json       ← generated stories for human review
-```
-
----
-
-## Configuration reference (`config.yaml`)
-
-### Model
-```yaml
-model:
-  name: "Qwen/Qwen2.5-7B-Instruct"   # or Qwen2.5-1.5B-Instruct / 72B-Instruct
-  torch_dtype: "bfloat16"
-  attn_implementation: "flash_attention_2"  # or "eager"
-```
-
-### QLoRA
-```yaml
-lora:
-  r: 64               # rank — higher → more parameters, more expressive
-  lora_alpha: 128     # scaling factor (α / r = 2 is a common heuristic)
-  lora_dropout: 0.05
-  target_modules:     # all linear projections in Qwen2's attention + MLP
-    - q_proj / k_proj / v_proj / o_proj
-    - gate_proj / up_proj / down_proj
-```
-
-### Training
-```yaml
-training:
-  num_train_epochs: 3
-  per_device_train_batch_size: 4
-  gradient_accumulation_steps: 8   # effective batch size = 32
-  learning_rate: 2.0e-4
-  lr_scheduler_type: "cosine"
-```
-
----
-
-## Data pipeline details (`data_prep.py`)
-
-1. **Load** raw data from HuggingFace or Kaggle
-2. **Clean** — strip Reddit markdown artefacts, collapse whitespace, remove `[WP]` tags
-3. **Filter** — remove rows with empty prompts or very short stories
-4. **Format** as [ChatML](https://huggingface.co/docs/transformers/chat_templating):
-   ```
-   <|im_start|>system
-   You are a creative writer. Given a writing prompt, craft a compelling, vivid...
-   <|im_end|>
-   <|im_start|>user
-   Writing prompt: [ WP ] You wake up to discover you have the ability to...
-   <|im_end|>
-   <|im_start|>assistant
-   The alarm clock showed 6:47 AM when I first noticed something was wrong...
-   <|im_end|>
-   ```
-5. **Split** deterministically (90 / 5 / 5) with `seed=42`
-
----
-
-## Training details (`train.py`)
-
-- **SFTTrainer** (TRL) with **causal language modelling** loss on full sequences
-- **QLoRA**: 4-bit NF4 quantisation of base weights, LoRA adapters in bfloat16
-- **Cosine LR schedule** with 5 % warmup; gradient clipping at 1.0
-- **Evaluation every 500 steps** on `eval_loss`; best checkpoint automatically kept
-- **After training**: LoRA weights are optionally merged into the full model for clean export
-
----
-
-## Evaluation details (`evaluate.py`)
-
-| Metric          | Description                                               |
-|-----------------|-----------------------------------------------------------|
-| **Perplexity**  | exp(mean NLL) on held-out test `text` sequences           |
-| **ROUGE-1/2/L** | Lexical n-gram overlap with reference stories             |
-| **BERTScore F1**| Semantic similarity via DeBERTa-XL token embeddings       |
-| **Distinct-1/2**| Diversity of generated unigrams / bigrams                 |
-
-Compare fine-tuned vs baseline with:
-```bash
-python evaluate.py --baseline                          # base Qwen
-python evaluate.py --model_path ./outputs/.../merged   # merged model
-```
-Results are written to `outputs/results/metrics_*.json` and `samples_*.json`.
-
----
-
-## Common CLI flags
+Create your Kaggle token:
 
 ```bash
-# data_prep.py
-python data_prep.py --source kaggle       # use Kaggle API
-python data_prep.py --max_train 5000      # smaller dataset for testing
-python data_prep.py --no_tokenize         # skip tokenizer (raw ChatML)
+mkdir -p ~/.kaggle
+nano ~/.kaggle/kaggle.json
+chmod 600 ~/.kaggle/kaggle.json
+```
 
-# train.py
-python train.py --model Qwen/Qwen2.5-1.5B-Instruct --epochs 1 --max_train 2000
-python train.py --resume ./outputs/.../checkpoint-1000
-python train.py --full_finetune           # disable QLoRA
-python train.py --skip_merge              # don't merge weights after training
+Then run:
 
-# evaluate.py
-python evaluate.py --num_samples 200
-python evaluate.py --model_path ./outputs/qwen-writing-prompts/merged_model
-python evaluate.py --baseline
+```bash
+kaggle datasets download -d ratthachat/writing-prompts -p data/raw --unzip
+```
+
+Expected files include:
+
+```text
+train.wp_source
+train.wp_target
+valid.wp_source
+valid.wp_target
+test.wp_source
+test.wp_target
 ```
 
 ---
 
-## Citation
+## 3. Prepare dataset
 
-```bibtex
-@inproceedings{fan-etal-2018-hierarchical,
-  title     = {Hierarchical Neural Story Generation},
-  author    = {Fan, Angela and Lewis, Mike and Dauphin, Yann},
-  booktitle = {Proceedings of ACL 2018},
-  year      = {2018},
-}
+```bash
+python scripts/prepare_dataset.py --config configs/default_config.yaml
 ```
+
+---
+
+## 4. Train model
+
+Basic run:
+
+```bash
+python scripts/train_qlora.py --config configs/default_config.yaml
+```
+
+Override parameters dynamically:
+
+```bash
+python scripts/train_qlora.py \
+  --config configs/default_config.yaml \
+  --model_name Qwen/Qwen2.5-3B-Instruct \
+  --output_dir models/qwen_3b_writing_lora \
+  --num_train_epochs 2 \
+  --learning_rate 0.00015 \
+  --lora_r 16 \
+  --lora_alpha 32 \
+  --max_seq_length 2048 \
+  --max_train_samples 5000
+```
+
+For an A10G 24GB GPU, you can try:
+
+```bash
+python scripts/train_qlora.py \
+  --config configs/default_config.yaml \
+  --model_name Qwen/Qwen2.5-7B-Instruct \
+  --output_dir models/qwen_7b_writing_lora \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 16 \
+  --max_seq_length 2048
+```
+
+---
+
+## 5. Test generation
+
+```bash
+python scripts/test_generate.py \
+  --config configs/default_config.yaml \
+  --adapter_path models/writing_prompts_lora \
+  --prompt "A lonely astronaut discovers that the moon has been writing letters to Earth."
+```
+
+---
+
+## 6. Run Streamlit UI
+
+```bash
+streamlit run streamlit_app.py
+```
+
+The UI lets you change fine-tuning parameters and launch dataset prep, training, and generation from one place.
+
+---
+
+## Recommended training strategy
+
+Start with a small run first:
+
+```bash
+python scripts/train_qlora.py \
+  --config configs/default_config.yaml \
+  --max_train_samples 5000 \
+  --max_eval_samples 500
+```
+
+Then scale once the pipeline works.
+
+Good starting models:
+
+```text
+Qwen/Qwen2.5-1.5B-Instruct
+Qwen/Qwen2.5-3B-Instruct
+Qwen/Qwen2.5-7B-Instruct
+mistralai/Mistral-7B-Instruct-v0.3
+meta-llama/Llama-3.1-8B-Instruct
+```
+
+Some gated models, such as Meta Llama models, require accepting the model license on Hugging Face and logging in:
+
+```bash
+huggingface-cli login
+```
+
+---
+
+## Notes
+
+If `nvidia-smi` is not available, you are probably not on a usable GPU machine or the NVIDIA driver is missing.
+
+For story generation, do not overtrain. One epoch is often enough for this dataset.
+
+
+---
+
+# Adversarial Self-Optimization Mode
+
+This repo also includes a self-improving adversarial loop.
+
+It is not a classic GAN. For language models, a practical adversarial setup is:
+
+```text
+Generator LLM
+    ↓
+Generate multiple candidate stories
+    ↓
+Critic scores each candidate
+    ↓
+Best story = chosen, worst story = rejected
+    ↓
+DPO trains the model to prefer chosen over rejected
+    ↓
+Repeat for several iterations
+```
+
+This uses DPO because TRL expects preference data with:
+
+```text
+prompt
+chosen
+rejected
+```
+
+The official TRL DPOTrainer documentation states that each training example should contain a prompt plus a preferred `chosen` completion and a dispreferred `rejected` completion.
+
+## Run adversarial self-optimization
+
+First do normal SFT:
+
+```bash
+python scripts/prepare_dataset.py --config configs/default_config.yaml
+
+python scripts/train_qlora.py \
+  --config configs/default_config.yaml \
+  --max_train_samples 5000
+```
+
+Then run adversarial self-optimization:
+
+```bash
+python scripts/adversarial_self_optimize.py \
+  --config configs/default_config.yaml \
+  --start_adapter_path models/writing_prompts_lora \
+  --iterations 3 \
+  --prompts_per_iteration 128 \
+  --candidates_per_prompt 4
+```
+
+Each iteration saves:
+
+```text
+models/adversarial_runs/iteration_01/scored_candidates.csv
+models/adversarial_runs/iteration_01/preference_pairs.csv
+models/adversarial_runs/iteration_01/iteration_metrics.json
+models/adversarial_runs/iteration_01/dpo_adapter/
+```
+
+The final adapter path is saved in:
+
+```text
+models/adversarial_runs/FINAL_ADAPTER_PATH.txt
+```
+
+## What the critic scores
+
+The default critic is heuristic and cheap. It scores:
+
+- prompt relevance
+- lexical diversity
+- repetition control
+- story length
+- narrative shape
+
+You can replace `score_story()` in:
+
+```text
+src/adversarial_utils.py
+```
+
+with a stronger reward model or an LLM judge later.
+
+## Important warning
+
+This loop can optimize toward the critic's weaknesses. That is the central failure mode.
+
+Do not trust critic score alone. Always inspect generated stories manually and keep a held-out prompt set for qualitative testing.
+
+
+---
+
+# Fully Integrated Streamlit UI
+
+The Streamlit UI now calls Python pipeline functions directly instead of launching CLI scripts.
+
+Run:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+The UI includes:
+
+```text
+Prepare Dataset
+Train SFT
+Adversarial Self-Optimization
+Generate / Test
+Metrics
+Config Preview
+```
+
+## Streamlit cache behavior
+
+The app uses:
+
+```python
+@st.cache_data
+```
+
+for:
+
+```text
+default config loading
+processed dataset summaries
+adversarial metrics tables
+```
+
+and:
+
+```python
+@st.cache_resource
+```
+
+for:
+
+```text
+loaded generation model + tokenizer
+```
+
+This means generation is much faster after the first load.
+
+If you train a new adapter or change model paths, click:
+
+```text
+Clear Streamlit cache
+```
+
+from the sidebar before generating with the new model.
+
+The training functions clear model cache automatically after SFT or adversarial DPO completes.
