@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="SshConfigs">
+    <configs>
+      <sshConfig host="34.234.74.254" id="c0c5b5ca-45ab-4eab-a8af-44a0ce84ed8c" keyPath="$PROJECT_DIR$/../Downloads/Sayan_Capstone.pem" port="22" nameFormat="DESCRIPTIVE" username="ubuntu" useOpenSSHConfig="true" />
+    </configs>
+  </component>
+</project>
