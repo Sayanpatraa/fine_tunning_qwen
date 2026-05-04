@@ -1,5 +1,5 @@
 
-# Qwen × WritingPrompts — Fine-Tuning Pipeline
+# Qwen & WritingPrompts — Fine-Tuning Pipeline
 
 > **QLoRA supervised fine-tuning of Qwen2.5 on the Reddit WritingPrompts dataset,
 > with train / validation / test splits and comprehensive automatic evaluation.**
